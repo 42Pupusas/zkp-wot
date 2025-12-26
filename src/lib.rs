@@ -1194,7 +1194,7 @@ mod tests {
 
         // Step 5: Publication
         println!("Step 5: Publish Trust Descriptor");
-        println!("  Location: Public (e.g., IPFS, Carol's website, blockchain)");
+        println!("  Location: Public (e.g., Blossom, Carol's website, blockchain)");
         println!("  Properties:");
         println!("    - Publicly available");
         println!("    - Cryptographically signed by Carol");
@@ -1498,7 +1498,7 @@ mod tests {
         println!("  Proof path: {}\n", proof_path);
 
         // Bob shares the proof with Alice
-        // Note: In production, Bob would upload to IPFS/CDN and share the CID
+        // Note: In production, Bob would upload to Blossom ort other CDN and share the CID
         // For this test, we simulate by storing the proof file path
         relay_notes.insert(
             "bob_proof_path".to_string(),
