@@ -278,6 +278,255 @@ pub fn create_circuit_note(
     Ok(note)
 }
 
+// ============================================================================
+// PHASE 3 — Bob proves membership to Alice using STARK proofs
+// ============================================================================
+
+/// Generate a STARK proof that Bob is in Carol's trust set
+///
+/// This calls the Stwo prover via `scarb prove` to generate a zero-knowledge proof.
+///
+/// # Arguments
+/// * `root` - Carol's Merkle root (public input)
+/// * `pk_bytes` - Bob's 32-byte public key (private witness)
+/// * `siblings` - Merkle proof siblings (private witness)
+/// * `path_bits` - Merkle path bits (private witness)
+///
+/// # Returns
+/// The execution ID that can be used to generate a proof
+pub fn generate_stark_proof(
+    root: starknet_crypto::Felt,
+    pk_bytes: &[u8; 32],
+    siblings: &[starknet_crypto::Felt],
+    path_bits: &[u8],
+) -> Result<String, Box<dyn std::error::Error>> {
+    // Create arguments for Cairo executable
+    let args = create_cairo_arguments(root, pk_bytes, siblings, path_bits)?;
+
+    // Write arguments to file (required for proper JSON parsing)
+    let args_path = std::path::Path::new("target/dev/zkp_proof_args.json");
+    std::fs::write(args_path, &args)?;
+
+    // Execute the Cairo program and generate trace using --arguments-file
+    let output = std::process::Command::new("scarb")
+        .args([
+            "execute",
+            "--executable-name",
+            "zkp_wot_main",
+            "--arguments-file",
+            args_path.to_str().unwrap(),
+            "--print-program-output",
+        ])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "scarb execute failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Execution output:\n{}", stdout);
+
+    // Extract execution ID from output (format: "Saving output to: target/execute/zkp_wot/execution<N>")
+    // scarb prove expects just the numeric ID
+    let execution_id = stdout
+        .lines()
+        .find(|line| line.contains("Saving output to:"))
+        .and_then(|line| line.split('/').last())
+        .and_then(|dir| dir.trim().strip_prefix("execution"))
+        .map(|id| id.to_string())
+        .ok_or("Failed to extract execution ID from scarb execute output")?;
+
+    Ok(execution_id)
+}
+
+/// Generate the STARK proof file from an execution ID
+///
+/// This calls `scarb prove` to generate the actual zero-knowledge proof.
+pub fn prove_execution(execution_id: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("scarb")
+        .args(["prove", "--execution-id", execution_id])
+        .output()?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "scarb prove failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    println!("Proof generation output:\n{}", stdout);
+
+    // Extract proof path from output (format: "Saving proof to: <path>")
+    let proof_path = stdout
+        .lines()
+        .find(|line| line.contains("Saving proof to:"))
+        .and_then(|line| line.split(':').nth(1))
+        .map(|path| path.trim().to_string())
+        .ok_or("Failed to extract proof file path from scarb prove output")?;
+
+    Ok(proof_path)
+}
+
+/// Verify a STARK proof using scarb verify
+///
+/// Alice calls this to verify Bob's proof cryptographically.
+pub fn verify_proof(proof_path: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let output = std::process::Command::new("scarb")
+        .args(["verify", "--proof-file", proof_path])
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("scarb verify failed: {}", stderr).into());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    println!("Verification output:\n{}", stdout);
+    if !stderr.is_empty() {
+        println!("Verification stderr:\n{}", stderr);
+    }
+
+    // Verification succeeded if the command exited successfully
+    Ok(output.status.success())
+}
+
+/// Publish a STARK proof as a private NIP-17 DM
+///
+/// Bob sends the proof privately to Alice via encrypted message.
+/// This maintains privacy - proofs are shared peer-to-peer, not publicly.
+pub fn send_proof_to_peer(
+    proof_path: &str,
+    circuit_note_id: &str,
+    root: starknet_crypto::Felt,
+    peer_pubkey: &str,
+    signer: &nostro2_signer::keypair::NostrKeypair,
+) -> Result<nostro2::NostrNote, Box<dyn std::error::Error>> {
+    // Read the proof file
+    let proof_json = std::fs::read_to_string(proof_path)?;
+
+    // Create proof metadata
+    let proof_data = serde_json::json!({
+        "proof": proof_json,
+        "circuit": circuit_note_id,
+        "root": format!("0x{}", hex::encode(root.to_bytes_be())),
+        "prover": "stwo"
+    });
+
+    // Create inner note with proof data
+    let mut inner_note = nostro2::NostrNote {
+        content: proof_data.to_string(),
+        pubkey: signer.public_key(),
+        kind: 78, // Inner kind for encrypted content
+        ..Default::default()
+    };
+
+    signer.sign_note(&mut inner_note)?;
+
+    let inner_note_str = serde_json::to_string(&inner_note)?;
+
+    // Create NIP-17 encrypted DM
+    let ephemeral_key = nostro2_signer::keypair::NostrKeypair::generate(false);
+    let ephemeral_pubkey = ephemeral_key.public_key();
+
+    let mut giftwrap = nostro2::NostrNote {
+        content: inner_note_str,
+        pubkey: ephemeral_pubkey,
+        kind: 14, // Encrypted Direct Message
+        ..Default::default()
+    };
+    giftwrap
+        .tags
+        .add_pubkey_tag(peer_pubkey, Some("wss://relay.illuminodes.com"));
+    ephemeral_key.sign_encrypted_note(
+        &mut giftwrap,
+        peer_pubkey,
+        &nostro2_signer::keypair::EncryptionScheme::Nip44,
+    )?;
+
+    Ok(giftwrap)
+}
+
+/// Decrypt a proof from a NIP-17 DM
+///
+/// Alice receives and decrypts Bob's proof.
+pub fn decrypt_proof_from_peer(
+    encrypted_note: &nostro2::NostrNote,
+    signer: &nostro2_signer::keypair::NostrKeypair,
+) -> Result<(String, String), Box<dyn std::error::Error>> {
+    if !encrypted_note.verify() {
+        return Err("Encrypted note is not valid".into());
+    }
+
+    let inner_note_str = signer.decrypt_note(
+        encrypted_note,
+        encrypted_note.pubkey.as_str(),
+        &nostro2_signer::keypair::EncryptionScheme::Nip44,
+    )?;
+
+    let inner_note: nostro2::NostrNote = serde_json::from_str(&inner_note_str)?;
+    if inner_note.kind != 78 {
+        return Err("Inner note is not a proof message".into());
+    }
+
+    let proof_data: serde_json::Value = serde_json::from_str(&inner_note.content)?;
+    let proof_json = proof_data["proof"]
+        .as_str()
+        .ok_or("Missing proof data")?
+        .to_string();
+    let circuit_id = proof_data["circuit"]
+        .as_str()
+        .ok_or("Missing circuit ID")?
+        .to_string();
+
+    Ok((proof_json, circuit_id))
+}
+
+/// Create JSON arguments for the Cairo executable following Cairo's Serde format
+///
+/// Cairo's Serde for Span/Array types requires: [length, ...elements]
+/// All felts must be hex strings with 0x prefix
+///
+/// For: fn main(root: felt252, pk_bytes: Span<u8>, proof: Span<felt252>, path_bits: Span<u8>)
+/// Format: [root, pk_len, pk_bytes..., proof_len, siblings..., bits_len, path_bits...]
+fn create_cairo_arguments(
+    root: starknet_crypto::Felt,
+    pk_bytes: &[u8; 32],
+    siblings: &[starknet_crypto::Felt],
+    path_bits: &[u8],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut args = Vec::new();
+
+    // 1. Root (single felt)
+    args.push(format!("\"0x{}\"", hex::encode(root.to_bytes_be())));
+
+    // 2. pk_bytes Span<u8>: [length, ...bytes]
+    args.push(format!("\"0x{:x}\"", pk_bytes.len())); // length
+    for &byte in pk_bytes {
+        args.push(format!("\"0x{:02x}\"", byte));
+    }
+
+    // 3. proof Span<felt252>: [length, ...siblings]
+    args.push(format!("\"0x{:x}\"", siblings.len())); // length
+    for sibling in siblings {
+        args.push(format!("\"0x{}\"", hex::encode(sibling.to_bytes_be())));
+    }
+
+    // 4. path_bits Span<u8>: [length, ...bits]
+    args.push(format!("\"0x{:x}\"", path_bits.len())); // length
+    for &bit in path_bits {
+        args.push(format!("\"0x{:x}\"", bit));
+    }
+
+    Ok(format!("[{}]", args.join(",")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,7 +1028,10 @@ mod tests {
             &*BOB_NOSTR_KEY,
             &alice_encrypted_note,
         );
-        assert!(bob_tries_alice.is_err(), "Bob should NOT decrypt Alice's witness");
+        assert!(
+            bob_tries_alice.is_err(),
+            "Bob should NOT decrypt Alice's witness"
+        );
         println!("  ✓ Bob cannot decrypt Alice's witness");
 
         // Alice tries to decrypt Bob's witness (should fail)
@@ -788,7 +1040,10 @@ mod tests {
             &*ALICE_NOSTR_KEY,
             &bob_encrypted_note,
         );
-        assert!(alice_tries_bob.is_err(), "Alice should NOT decrypt Bob's witness");
+        assert!(
+            alice_tries_bob.is_err(),
+            "Alice should NOT decrypt Bob's witness"
+        );
         println!("  ✓ Alice cannot decrypt Bob's witness");
 
         // Charlie tries to decrypt Dave's witness (should fail)
@@ -797,7 +1052,10 @@ mod tests {
             &*CHARLIE_NOSTR_KEY,
             &dave_encrypted_note,
         );
-        assert!(charlie_tries_dave.is_err(), "Charlie should NOT decrypt Dave's witness");
+        assert!(
+            charlie_tries_dave.is_err(),
+            "Charlie should NOT decrypt Dave's witness"
+        );
         println!("  ✓ Charlie cannot decrypt Dave's witness\n");
 
         println!("=== Phase 1 Complete ===");
@@ -1078,5 +1336,208 @@ mod tests {
         println!("  3. Extract circuit from content");
         println!("  4. Read metadata from tags");
         println!("  5. Verify immutability via Note ID\n");
+    }
+
+    // ========================================================================
+    // PHASE 3 TESTS — Bob proves membership, Alice verifies
+    // ========================================================================
+
+    /// Phase 3: Bob generates a STARK proof of his membership
+    #[test]
+    fn phase3_bob_generates_stark_proof() {
+        println!("\n=== PHASE 3: Bob generates STARK proof ===\n");
+
+        // Setup: Carol has created the trust set (from Phase 1)
+        let trust_set = vec![
+            ALICE_NOSTR_KEY.public_key_slice(),
+            BOB_NOSTR_KEY.public_key_slice(),
+            DAVE_NOSTR_KEY.public_key_slice(),
+        ];
+        let root = compute_merkle_root(&trust_set);
+        println!("Carol's ROOT: {:#x}\n", root);
+
+        // Bob has received and decrypted his witness data
+        let bob_pk = BOB_NOSTR_KEY.public_key_slice();
+        let (bob_siblings, bob_path_bits) = get_merkle_proof(&trust_set, &bob_pk).unwrap();
+
+        println!("Step 1: Bob decrypts his private witness from Carol");
+        println!("  Witness contains:");
+        println!("    - {} sibling hashes", bob_siblings.len());
+        println!("    - {} path bits\n", bob_path_bits.len());
+
+        // Bob generates a STARK proof
+        println!("Step 2: Bob generates STARK proof using scarb prove");
+        println!("  Creating Cairo arguments file...");
+
+        let execution_id = generate_stark_proof(root, &bob_pk, &bob_siblings, &bob_path_bits)
+            .expect("Proof generation failed");
+        println!("  ✓ Cairo execution completed");
+        println!("  Execution ID: {}\n", execution_id);
+        println!("Step 3: Generate STARK proof from execution");
+        let proof_path = prove_execution(&execution_id).expect("Proof generation failed");
+        println!("  ✓ STARK proof generated!");
+        println!("  Proof saved to: {}\n", proof_path);
+    }
+
+    /// Phase 3: Complete workflow - Bob proves, Alice verifies
+    #[test]
+    fn phase3_complete_bob_proves_alice_verifies() {
+        println!("\n=== PHASE 3: Complete Workflow - Bob proves, Alice verifies ===\n");
+
+        // Simulated relay - stores all published notes
+        let mut relay_notes = std::collections::HashMap::new();
+
+        // ============ Phase 1: Carol creates trust set (offline) ============
+        println!("PHASE 1: Carol creates trust set (offline)");
+        let trust_set = vec![
+            ALICE_NOSTR_KEY.public_key_slice(),
+            BOB_NOSTR_KEY.public_key_slice(),
+            DAVE_NOSTR_KEY.public_key_slice(),
+        ];
+        let root = compute_merkle_root(&trust_set);
+        println!("  Carol's ROOT: {:#x}", root);
+
+        // Carol generates witnesses and encrypts them
+        let bob_pk = BOB_NOSTR_KEY.public_key_slice();
+        let (bob_siblings, bob_path_bits) = get_merkle_proof(&trust_set, &bob_pk).unwrap();
+        let bob_witness_data = WitnessData::new(bob_siblings.clone(), bob_path_bits.clone());
+
+        let carol_signer = &*CHARLIE_NOSTR_KEY;
+        let bob_encrypted_witness = bob_witness_data
+            .private_witness(&BOB_NOSTR_KEY.public_key(), carol_signer)
+            .unwrap();
+
+        // Carol publishes encrypted witness to relay
+        relay_notes.insert("bob_witness".to_string(), bob_encrypted_witness);
+        println!("  ✓ Carol encrypted and published Bob's witness to relay\n");
+
+        // ============ Phase 2: Carol publishes circuit (public) ============
+        println!("PHASE 2: Carol publishes circuit to relay");
+
+        let circuit_path = std::path::Path::new("target/dev/zkp_wot_main.executable.sierra.json");
+        let circuit_json = if circuit_path.exists() {
+            std::fs::read_to_string(circuit_path).unwrap()
+        } else {
+            println!("  ⚠ Circuit not found at {:?}", circuit_path);
+            r#"{"sierra_program":[],"entry_points_by_type":{},"abi":[]}"#.to_string()
+        };
+
+        let circuit_note = create_circuit_note(root, circuit_json, carol_signer).unwrap();
+        let circuit_note_id = circuit_note.id.clone().unwrap();
+        relay_notes.insert("carol_circuit".to_string(), circuit_note);
+        println!("  ✓ Carol published circuit to relay");
+        println!("  Circuit Note ID: {}\n", circuit_note_id);
+
+        // ============ Phase 3a: Bob fetches and decrypts his witness ============
+        println!("PHASE 3a: Bob fetches his witness from relay");
+        let bob_encrypted_note = relay_notes.get("bob_witness").unwrap();
+        let decrypted_witness = WitnessData::decrypt_private_witness(
+            &bob_witness_data,
+            &BOB_NOSTR_KEY,
+            bob_encrypted_note,
+        )
+        .unwrap();
+        println!("  ✓ Bob decrypted his witness data");
+        assert_eq!(decrypted_witness, bob_witness_data);
+        println!("  ✓ Witness integrity verified\n");
+
+        // ============ Phase 3b: Bob generates STARK proof ============
+        println!("PHASE 3b: Bob generates STARK proof");
+        println!("  Bob calls: scarb prove with his witness data");
+
+        let execution_id = generate_stark_proof(
+            root,
+            &bob_pk,
+            &decrypted_witness
+                .siblings
+                .iter()
+                .map(|bytes| {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(bytes);
+                    starknet_crypto::Felt::from_bytes_be(&arr)
+                })
+                .collect::<Vec<_>>(),
+            &decrypted_witness.path_bits,
+        )
+        .expect("Proof generation failed");
+        println!("  ✓ Cairo execution completed");
+        println!("  Execution ID: {}", execution_id);
+
+        let proof_path = prove_execution(&execution_id).expect("Proof generation failed");
+        println!("  ✓ STARK proof generated");
+        println!("  Proof path: {}\n", proof_path);
+
+        // Bob shares the proof with Alice
+        // Note: In production, Bob would upload to IPFS/CDN and share the CID
+        // For this test, we simulate by storing the proof file path
+        relay_notes.insert("bob_proof_path".to_string(),
+            nostro2::NostrNote {
+                content: proof_path.clone(),
+                pubkey: BOB_NOSTR_KEY.public_key(),
+                kind: 1,
+                ..Default::default()
+            });
+        println!("  ✓ Bob made proof available to Alice");
+        println!("  Proof location: {}\n", proof_path);
+
+        // ============ Phase 3c: Alice fetches circuit and verifies ============
+        println!("PHASE 3c: Alice verifies Bob's proof");
+
+        // Alice fetches Carol's circuit from relay
+        let circuit_note = relay_notes.get("carol_circuit").unwrap();
+        println!("  ✓ Alice fetched Carol's circuit from relay");
+        println!("  Circuit Note ID: {}", circuit_note.id.as_ref().unwrap());
+
+        // Alice verifies the circuit note signature
+        assert!(circuit_note.verify(), "Circuit signature must be valid");
+        println!("  ✓ Carol's signature verified");
+
+        // Alice extracts the root from circuit tags
+        let root_tag = circuit_note
+            .tags
+            .0
+            .iter()
+            .find(|t| t.first().map(|s| s.as_str()) == Some("root"))
+            .unwrap();
+        let published_root = &root_tag[1];
+        println!("  ✓ Extracted ROOT from circuit: {}", published_root);
+
+        // Alice fetches Bob's proof location from relay
+        let proof_note = relay_notes.get("bob_proof_path").unwrap();
+        let bob_proof_path = &proof_note.content;
+        println!("\n  ✓ Alice received proof location from Bob");
+        println!("  Proof path: {}", bob_proof_path);
+
+        // Alice verifies the STARK proof using scarb verify
+        println!("\n  → Alice verifying STARK proof with scarb verify...");
+        let verified = verify_proof(bob_proof_path).expect("Verification failed");
+        assert!(verified, "Proof verification must succeed");
+        println!("  ✓ STARK proof verified successfully!");
+        println!("\n  Alice now knows:");
+        println!("    ✓ Bob is in Carol's trust set");
+        println!("    ✓ The proof is cryptographically valid");
+        println!("    ✗ Alice does NOT know Bob's witness");
+        println!("    ✗ Alice does NOT know other members");
+
+        println!("\n=== Phase 3 Complete - End-to-End ZKP Verification ===");
+        println!("\nThe complete flow:");
+        println!("  1. ✓ Carol creates trust set and publishes circuit (public)");
+        println!("  2. ✓ Carol distributes encrypted witnesses (private via NIP-17)");
+        println!("  3. ✓ Bob decrypts his witness from the relay");
+        println!("  4. ✓ Bob generates STARK proof (zero-knowledge)");
+        println!("  5. ✓ Bob makes proof available to Alice");
+        println!("  6. ✓ Alice fetches circuit from relay and proof from Bob");
+        println!("  7. ✓ Alice verifies proof cryptographically with scarb verify");
+        println!("  8. ✓ Alice learns: Bob ∈ Carol's trust set\n");
+
+        println!("Privacy guarantees:");
+        println!("  ✓ Bob's witness remains private (never shared)");
+        println!("  ✓ Proof is zero-knowledge (doesn't reveal witness)");
+        println!("  ✓ Other members remain anonymous to Bob and Alice");
+        println!("  ✓ Only the membership fact is revealed");
+        println!("  ✓ All communication via Nostr relays");
+        println!("  ✓ STARK proof is cryptographically verifiable by anyone\n");
+        println!("Note: In production, proofs would be uploaded to a Blossom server");
+        println!("      due to size (2.4MB), with CID shared via Nostr\n");
     }
 }

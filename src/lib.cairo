@@ -138,6 +138,9 @@ fn verify_membership(
 ///
 /// This is the function that will be compiled into a STARK circuit.
 /// The verifier key (VK) will be derived from this program.
+///
+/// This function is marked as executable so it can be proven using `scarb prove`.
+#[executable]
 fn main(
     root: felt252, // public input - Carol's trust commitment
     pk_bytes: Span<u8>, // private witness - member's public key

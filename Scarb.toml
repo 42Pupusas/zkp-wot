@@ -5,14 +5,19 @@ edition = "2024_07"
 
 # See more keys and their definitions at https://docs.swmansion.com/scarb/docs/reference/manifest.html
 
+[cairo]
+enable-gas = false
+
 [dependencies]
 starknet = "2.13.1"
+cairo_execute = "2.13.1"
 
 [dev-dependencies]
 snforge_std = "0.52.0"
 assert_macros = "2.13.1"
 
-[[target.starknet-contract]]
+[[target.executable]]
+name = "zkp_wot_main"
 sierra = true
 
 [scripts]
